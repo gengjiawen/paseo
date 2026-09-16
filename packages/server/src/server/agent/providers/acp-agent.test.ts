@@ -995,8 +995,8 @@ describe("ACPAgentSession Zed parity", () => {
     await expect(internals.applyConfiguredOverrides()).resolves.toBeUndefined();
     expect(setSessionConfigOption).not.toHaveBeenCalled();
     expect(childLogger.warn).toHaveBeenCalledWith(
-      { featureId: "fast", model: "kimi-k3" },
-      "acp does not expose ACP feature 'fast' for the current model; leaving it at the provider default",
+      { err: expect.any(Error), featureId: "fast", model: "kimi-k3" },
+      "acp cannot apply ACP feature 'fast' to the current model; leaving it at the provider default",
     );
   });
 
@@ -1013,7 +1013,12 @@ describe("ACPAgentSession Zed parity", () => {
       },
       logger,
     );
-    const rejection = new Error("Unknown model config option: fast");
+    // What cursor-agent answers for a parameter the current model does not have.
+    const rejection = {
+      code: -32602,
+      message: "Invalid params",
+      data: { message: "Unknown model config option: fast" },
+    };
     const setSessionConfigOption = vi.fn(async () => {
       throw rejection;
     });
@@ -1032,8 +1037,70 @@ describe("ACPAgentSession Zed parity", () => {
     });
     expect(childLogger.warn).toHaveBeenCalledWith(
       { err: rejection, featureId: "fast", model: "kimi-k3" },
-      "acp rejected ACP feature 'fast' for the current model; leaving it at the provider default",
+      "acp cannot apply ACP feature 'fast' to the current model; leaving it at the provider default",
     );
+  });
+
+  test("fails session start when a stored feature write fails for an unrelated reason", async () => {
+    const session = createSessionWithConfig({
+      provider: "acp",
+      model: "kimi-k3",
+      featureValues: { fast: "true" },
+      configFeatureOptions: [PER_MODEL_FEATURE_OPTION],
+    });
+    const setSessionConfigOption = vi.fn(async () => {
+      throw new Error("write EPIPE");
+    });
+    const { internals } = prepareConfiguredOverrideSession(session, {
+      currentModel: "kimi-k3",
+      availableModels: [{ modelId: "kimi-k3", name: "Kimi K3" }],
+      configOptions: [fastConfigOption("false")],
+      connection: { setSessionConfigOption },
+    });
+
+    await expect(internals.applyConfiguredOverrides()).rejects.toThrow("write EPIPE");
+  });
+
+  test("applies a stored feature value the provider accepts after a model switch left stale options", async () => {
+    const logger = createTestLogger();
+    const childLogger = { trace: vi.fn(), warn: vi.fn() };
+    vi.spyOn(logger, "child").mockReturnValue(asInternals<typeof logger>(childLogger));
+    const session = createSessionWithConfig(
+      {
+        provider: "acp",
+        model: "composer-2.5",
+        featureValues: { fast: "true" },
+        configFeatureOptions: [PER_MODEL_FEATURE_OPTION],
+      },
+      logger,
+    );
+    // `unstable_setSessionModel` answers with an empty response, so the session still holds
+    // the options of the model `session/new` reported — Kimi K3, which has no `fast`.
+    const setSessionConfigOption = vi.fn(async () => ({
+      configOptions: [fastConfigOption("true")],
+    }));
+    const { internals, unstableSetSessionModel } = prepareConfiguredOverrideSession(session, {
+      currentModel: "kimi-k3",
+      availableModels: [
+        { modelId: "kimi-k3", name: "Kimi K3" },
+        { modelId: "composer-2.5", name: "Composer 2.5" },
+      ],
+      configOptions: [selectConfigOption("thought_level", ["low", "max"], "max")],
+      connection: { setSessionConfigOption },
+    });
+
+    await expect(internals.applyConfiguredOverrides()).resolves.toBeUndefined();
+    expect(unstableSetSessionModel).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      modelId: "composer-2.5",
+    });
+    expect(setSessionConfigOption).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      configId: "fast",
+      value: "true",
+    });
+    expect(internals.configOptions).toEqual([fastConfigOption("true")]);
+    expect(childLogger.warn).not.toHaveBeenCalled();
   });
 
   test("routes config_option_update and refreshes derived mode, model, and thinking state", async () => {
