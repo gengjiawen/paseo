@@ -412,6 +412,31 @@ export type ACPCatalogModelResolver = (
   context: ACPCatalogModelResolverContext,
 ) => Promise<AgentModelDefinition[]>;
 
+/**
+ * Context handed to an {@link ACPModelConfigOptionsResolver} while answering a draft
+ * feature listing. `configOptions` is what the probe session reported, i.e. the options
+ * of whatever model the provider CLI last persisted.
+ */
+export interface ACPModelConfigOptionsResolverContext {
+  connection: Pick<ClientSideConnection, "extMethod">;
+  modelId: string;
+  configOptions: SessionConfigOption[] | null | undefined;
+  runRequest: <T>(request: () => Promise<T>) => Promise<T>;
+  transformConfigOptions: (configOptions: SessionConfigOption[]) => SessionConfigOption[];
+  logger: Logger;
+  provider: string;
+}
+
+/**
+ * Providers whose session config options depend on the selected model own this hook. A
+ * probe session only reports one model's options, so without a resolver Paseo would offer
+ * features the drafted model does not have. Return null when the model is unknown, which
+ * leaves the probe session's options in place.
+ */
+export type ACPModelConfigOptionsResolver = (
+  context: ACPModelConfigOptionsResolverContext,
+) => Promise<SessionConfigOption[] | null>;
+
 interface ACPAgentClientOptions {
   provider: string;
   logger: Logger;
@@ -419,6 +444,7 @@ interface ACPAgentClientOptions {
   defaultCommand: [string, ...string[]];
   defaultModes?: AgentMode[];
   catalogModelResolver?: ACPCatalogModelResolver;
+  modelConfigOptionsResolver?: ACPModelConfigOptionsResolver;
   modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
   sessionResponseTransformer?: (response: SessionStateResponse) => SessionStateResponse;
   configOptionsTransformer?: (configOptions: SessionConfigOption[]) => SessionConfigOption[];
@@ -875,6 +901,7 @@ export class ACPAgentClient implements AgentClient {
   protected readonly defaultCommand: [string, ...string[]];
   protected readonly defaultModes: AgentMode[];
   private readonly catalogModelResolver?: ACPCatalogModelResolver;
+  private readonly modelConfigOptionsResolver?: ACPModelConfigOptionsResolver;
   private readonly modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
   private readonly sessionResponseTransformer?: (
     response: SessionStateResponse,
@@ -917,6 +944,7 @@ export class ACPAgentClient implements AgentClient {
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes ?? [];
     this.catalogModelResolver = options.catalogModelResolver;
+    this.modelConfigOptionsResolver = options.modelConfigOptionsResolver;
     this.modelTransformer = options.modelTransformer;
     this.sessionResponseTransformer = options.sessionResponseTransformer;
     this.configOptionsTransformer = options.configOptionsTransformer;
@@ -1137,13 +1165,45 @@ export class ACPAgentClient implements AgentClient {
       );
       probeSessionId = response.sessionId;
       const transformed = this.transformSessionResponse(response);
+      const configOptions = await this.resolveModelConfigOptions({
+        connection: probe.connection,
+        model: config.model,
+        sessionConfigOptions: transformed.configOptions,
+      });
       return [
         autoAcceptFeature,
-        ...deriveFeaturesFromACP(transformed.configOptions, this.configFeatureOptions),
+        ...deriveFeaturesFromACP(configOptions, this.configFeatureOptions),
       ];
     } finally {
       await this.closeProbe(probe, probeSessionId);
     }
+  }
+
+  // A probe session reports the config options of whichever model the provider CLI last
+  // persisted, so a provider whose options are per-model (Cursor's `fast` exists only for
+  // models with a fast variant) has to answer for the model the draft actually selected.
+  private async resolveModelConfigOptions(input: {
+    connection: Pick<ClientSideConnection, "extMethod">;
+    model: string | undefined;
+    sessionConfigOptions: SessionConfigOption[] | null | undefined;
+  }): Promise<SessionConfigOption[] | null | undefined> {
+    if (!this.modelConfigOptionsResolver || !input.model) {
+      return input.sessionConfigOptions;
+    }
+
+    const resolved = await this.modelConfigOptionsResolver({
+      connection: input.connection,
+      modelId: input.model,
+      configOptions: input.sessionConfigOptions,
+      runRequest: (request) => this.runACPRequest(request),
+      transformConfigOptions: (configOptions) =>
+        this.configOptionsTransformer
+          ? this.configOptionsTransformer(configOptions)
+          : configOptions,
+      logger: this.logger,
+      provider: this.provider,
+    });
+    return resolved ?? input.sessionConfigOptions;
   }
 
   async listImportableSessions(
@@ -2835,12 +2895,36 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.config.thinkingOptionId && this.config.thinkingOptionId !== this.thinkingOptionId) {
       await this.setThinkingOption(this.config.thinkingOptionId);
     }
+    await this.applyConfiguredFeatureValues();
+  }
+
+  // Feature values are stored per provider while some providers expose a feature only for
+  // certain models (Cursor's `fast`). A stored value the selected model has no option for
+  // must not fail session start, the same way an inapplicable stored model does not.
+  private async applyConfiguredFeatureValues(): Promise<void> {
     const configuredFeatureValues = this.config.featureValues ?? {};
     for (const featureOption of this.configFeatureOptions) {
       if (!Object.prototype.hasOwnProperty.call(configuredFeatureValues, featureOption.id)) {
         continue;
       }
-      await this.setFeature(featureOption.id, configuredFeatureValues[featureOption.id]);
+      if (!findSelectConfigFeatureOption(this.configOptions, featureOption)) {
+        this.logger.warn(
+          { featureId: featureOption.id, model: this.currentModel },
+          `${this.provider} does not expose ACP feature '${featureOption.id}' for the current model; leaving it at the provider default`,
+        );
+        continue;
+      }
+      try {
+        await this.setFeature(featureOption.id, configuredFeatureValues[featureOption.id]);
+      } catch (error) {
+        // The session's config options can predate a model switch, because
+        // `unstable_setSessionModel` does not return refreshed options. The provider then
+        // rejects the write for a feature its current model dropped.
+        this.logger.warn(
+          { err: error, featureId: featureOption.id, model: this.currentModel },
+          `${this.provider} rejected ACP feature '${featureOption.id}' for the current model; leaving it at the provider default`,
+        );
+      }
     }
   }
 

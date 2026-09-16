@@ -18,6 +18,7 @@ import {
 import {
   ACPAgentClient,
   ACPAgentSession,
+  type ACPConfigFeatureOption,
   type SpawnedACPProcess,
   type SessionStateResponse,
   buildACPClientCapabilities,
@@ -183,6 +184,7 @@ function createSessionWithConfig(
     modeId?: string | null;
     model?: string | null;
     featureValues?: Record<string, unknown>;
+    configFeatureOptions?: ACPConfigFeatureOption[];
   } = {},
   logger: ReturnType<typeof createTestLogger> = createTestLogger(),
 ): ACPAgentSession {
@@ -199,6 +201,7 @@ function createSessionWithConfig(
       logger,
       defaultCommand: ["claude", "--acp"],
       defaultModes: [],
+      ...(config.configFeatureOptions ? { configFeatureOptions: config.configFeatureOptions } : {}),
       capabilities: {
         supportsStreaming: true,
         supportsSessionPersistence: true,
@@ -279,6 +282,26 @@ function selectConfigOption(
     type: "select",
     currentValue,
     options: values.map((value) => ({ value, name: value })),
+  };
+}
+
+// Stand-in for a provider feature that only some models expose, like Cursor's `fast`.
+const PER_MODEL_FEATURE_OPTION: ACPConfigFeatureOption = {
+  id: "fast",
+  configId: "fast",
+  label: "Fast",
+};
+
+function fastConfigOption(currentValue: "false" | "true"): SessionConfigOption {
+  return {
+    id: "fast",
+    name: "Fast",
+    type: "select",
+    currentValue,
+    options: [
+      { value: "false", name: "Off" },
+      { value: "true", name: "Fast" },
+    ],
   };
 }
 
@@ -947,6 +970,69 @@ describe("ACPAgentSession Zed parity", () => {
     expect(childLogger.warn).toHaveBeenCalledWith(
       { value: "deepseek/v4" },
       "deepseek-tui does not expose ACP model selection; using provider default model",
+    );
+  });
+
+  test("does not fail session start when the selected model has no option for a stored feature", async () => {
+    const logger = createTestLogger();
+    const childLogger = { trace: vi.fn(), warn: vi.fn() };
+    vi.spyOn(logger, "child").mockReturnValue(asInternals<typeof logger>(childLogger));
+    const session = createSessionWithConfig(
+      {
+        provider: "acp",
+        model: "kimi-k3",
+        featureValues: { fast: "true" },
+        configFeatureOptions: [PER_MODEL_FEATURE_OPTION],
+      },
+      logger,
+    );
+    const { internals, setSessionConfigOption } = prepareConfiguredOverrideSession(session, {
+      currentModel: "kimi-k3",
+      availableModels: [{ modelId: "kimi-k3", name: "Kimi K3" }],
+      configOptions: [selectConfigOption("thought_level", ["low", "max"], "max")],
+    });
+
+    await expect(internals.applyConfiguredOverrides()).resolves.toBeUndefined();
+    expect(setSessionConfigOption).not.toHaveBeenCalled();
+    expect(childLogger.warn).toHaveBeenCalledWith(
+      { featureId: "fast", model: "kimi-k3" },
+      "acp does not expose ACP feature 'fast' for the current model; leaving it at the provider default",
+    );
+  });
+
+  test("does not fail session start when the provider rejects a stored feature write", async () => {
+    const logger = createTestLogger();
+    const childLogger = { trace: vi.fn(), warn: vi.fn() };
+    vi.spyOn(logger, "child").mockReturnValue(asInternals<typeof logger>(childLogger));
+    const session = createSessionWithConfig(
+      {
+        provider: "acp",
+        model: "kimi-k3",
+        featureValues: { fast: "true" },
+        configFeatureOptions: [PER_MODEL_FEATURE_OPTION],
+      },
+      logger,
+    );
+    const rejection = new Error("Unknown model config option: fast");
+    const setSessionConfigOption = vi.fn(async () => {
+      throw rejection;
+    });
+    const { internals } = prepareConfiguredOverrideSession(session, {
+      currentModel: "kimi-k3",
+      availableModels: [{ modelId: "kimi-k3", name: "Kimi K3" }],
+      configOptions: [fastConfigOption("false")],
+      connection: { setSessionConfigOption },
+    });
+
+    await expect(internals.applyConfiguredOverrides()).resolves.toBeUndefined();
+    expect(setSessionConfigOption).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      configId: "fast",
+      value: "true",
+    });
+    expect(childLogger.warn).toHaveBeenCalledWith(
+      { err: rejection, featureId: "fast", model: "kimi-k3" },
+      "acp rejected ACP feature 'fast' for the current model; leaving it at the provider default",
     );
   });
 
