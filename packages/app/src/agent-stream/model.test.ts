@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { StreamItem } from "@/types/stream";
+import { projectPluginTimelineItems } from "@/plugins/timeline/projection";
+import { findMountedWindowStart } from "./history-window";
 import { buildAgentStreamRenderModel } from "./model";
 
 function createTimestamp(seed: number): Date {
@@ -69,10 +71,34 @@ describe("buildAgentStreamRenderModel", () => {
 
     expect(model.turnTiming.byAssistantId.has("hidden-a")).toBe(false);
     expect(model.turnTiming.byAssistantId.get("visible-a")).toEqual({
-      startedAt: tail[2]?.timestamp,
       completedAt: tail[3]?.timestamp,
       durationMs: 1000,
     });
+  });
+
+  it("keeps the mounted boundary stable when a transformer filters an earlier item", () => {
+    const tail = [
+      userMessage("filtered", 1),
+      assistantMessage("hidden", 2),
+      userMessage("visible-u", 3),
+      assistantMessage("visible-a", 4),
+    ];
+
+    const projectedTail = projectPluginTimelineItems(tail, ({ sourceId }) =>
+      sourceId === "filtered" ? [] : undefined,
+    );
+    const historyStart = findMountedWindowStart({ items: projectedTail, minMountedCount: 2 });
+    const model = buildAgentStreamRenderModel({
+      isTurnActive: false,
+      activeTurnStartedAt: null,
+      tail: projectedTail,
+      head: [],
+      platform: "native",
+      isMobileBreakpoint: false,
+      historyStart,
+    });
+
+    expect(model.history.map((item) => item.id)).toEqual(["visible-a", "visible-u"]);
   });
 
   it("keeps head separate from committed history on desktop web", () => {
@@ -176,7 +202,6 @@ describe("buildAgentStreamRenderModel", () => {
 
     expect(model.turnTiming.runningStartedAt).toBe(null);
     expect(model.turnTiming.byAssistantId.get("live-a")).toEqual({
-      startedAt: tail[0]?.timestamp,
       completedAt: head[0]?.timestamp,
       durationMs: 3000,
     });
@@ -196,7 +221,6 @@ describe("buildAgentStreamRenderModel", () => {
 
     expect(model.segments.historyMounted.map((item) => item.id)).toEqual(["a1", "u1"]);
     expect(model.turnTiming.byAssistantId.get("a1")).toEqual({
-      startedAt: tail[0]?.timestamp,
       completedAt: tail[1]?.timestamp,
       durationMs: 3000,
     });
@@ -216,4 +240,47 @@ describe("buildAgentStreamRenderModel", () => {
 
     expect(model.turnTiming.byAssistantId.size).toBe(0);
   });
+
+  it.each(["web", "native"] as const)(
+    "reuses rendered history and timing across live-head updates inside a history window on %s",
+    (platform) => {
+      const at = (seed: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, seed));
+      const tail: StreamItem[] = [];
+      for (let index = 0; index < 40; index += 1) {
+        tail.push(
+          { ...userMessage(`u${index}`, 0), timestamp: at(index * 2) },
+          { ...assistantMessage(`a${index}`, 0), timestamp: at(index * 2 + 1) },
+        );
+      }
+      const live = (text: string): StreamItem => ({
+        kind: "assistant_message",
+        id: "live",
+        text,
+        timestamp: at(81),
+      });
+      const build = (head: StreamItem[]) =>
+        buildAgentStreamRenderModel({
+          isTurnActive: true,
+          activeTurnStartedAt: tail.at(-2)?.timestamp ?? null,
+          tail,
+          head,
+          platform,
+          isMobileBreakpoint: false,
+          historyStart: 60,
+        });
+
+      const first = build([live("live")]);
+      const second = build([live("live grows")]);
+
+      expect(second.history).toBe(first.history);
+      expect(second.segments.historyMounted).toBe(first.segments.historyMounted);
+      expect(second.turnTiming.byAssistantId).toBe(first.turnTiming.byAssistantId);
+      expect(first.history).toHaveLength(20);
+      expect(first.turnTiming.byAssistantId.has("a29")).toBe(false);
+      expect(first.turnTiming.byAssistantId.get("a38")).toEqual({
+        completedAt: tail[77]?.timestamp,
+        durationMs: 1000,
+      });
+    },
+  );
 });

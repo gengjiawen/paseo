@@ -22,12 +22,13 @@ import {
   expectSetupPanel,
   openHomeWithProject,
   navigateToWorkspaceViaSidebar,
-  returnHomeFromWorkspace,
+  leaveWorkspaceViaHistory,
   openWorkspaceScriptsMenu,
   startWorkspaceScriptFromMenu,
   closeWorkspaceScriptsMenu,
   seedProjectForWorkspaceSetup,
   waitForWorkspaceSetupProgress,
+  observeSetupPanelTraffic,
 } from "../support/helpers/workspace-setup";
 
 interface WorkspaceScriptStarter {
@@ -87,8 +88,7 @@ test.describe("Workspace setup streaming", () => {
     try {
       await seedProjectForWorkspaceSetup(client, repo.path);
 
-      // Wait for setup completion via daemon (setup snapshots are per-session,
-      // so the browser session won't receive progress events).
+      // The setup client owns progress before creating the workspace.
       const completed = waitForWorkspaceSetupProgress(
         client,
         (payload) =>
@@ -111,6 +111,45 @@ test.describe("Workspace setup streaming", () => {
       await openFileExplorer(page);
       await expectExplorerEntryVisible(page, "README.md");
       await expectExplorerEntryVisible(page, "src");
+    } finally {
+      await client.close();
+      await repo.cleanup();
+    }
+  });
+
+  test("setup panel releases details while retained behind another tab and resubscribes when shown", async ({
+    page,
+  }) => {
+    const client = await connectWorkspaceSetupClient();
+    const repo = await createTempGitRepo("setup-membership-", {
+      paseoConfig: { worktree: { setup: ["echo setup complete"] } },
+    });
+    const traffic = observeSetupPanelTraffic(page);
+    try {
+      await seedProjectForWorkspaceSetup(client, repo.path);
+      const completed = waitForWorkspaceSetupProgress(
+        client,
+        (payload) => payload.status === "completed",
+      );
+      const workspace = await createWorkspaceThroughDaemon(client, {
+        cwd: repo.path,
+        worktreeSlug: "setup-membership",
+      });
+      await completed;
+      await openHomeWithProject(page, repo.path);
+      await navigateToWorkspaceViaSidebar(page, workspace.id);
+      await expectSetupTabNotSeeded(page, workspace.id);
+      await traffic.expectNoDemand();
+      await expectSetupPanel(page);
+      await traffic.expectSubscribed(workspace.id, 1);
+      await expect(page.getByTestId("workspace-setup-log").first()).toContainText("setup complete");
+      await clickNewChat(page);
+      await expectComposerVisible(page);
+      await traffic.expectReleased(0);
+      await expectSetupPanel(page);
+      await traffic.expectSubscribed(workspace.id, 2);
+      await closeSetupTab(page, workspace.id);
+      await traffic.expectReleased(1);
     } finally {
       await client.close();
       await repo.cleanup();
@@ -195,9 +234,44 @@ test.describe("Workspace setup streaming", () => {
       await expectFailedSetupTabSeededInMainPane(page, workspace.id);
 
       await closeSetupTab(page, workspace.id);
-      await returnHomeFromWorkspace(page);
+      await leaveWorkspaceViaHistory(page);
       await navigateToWorkspaceViaSidebar(page, workspace.id);
       await expectSetupTabNotSeeded(page, workspace.id);
+    } finally {
+      await client.close();
+      await repo.cleanup();
+    }
+  });
+
+  test("keeps a workspace usable when its setup config cannot be parsed", async ({ page }) => {
+    const client = await connectWorkspaceSetupClient();
+    const repo = await createTempGitRepo("setup-invalid-config-", {
+      files: [{ path: "paseo.json", content: "{ invalid json\n" }],
+    });
+
+    try {
+      await seedProjectForWorkspaceSetup(client, repo.path);
+      const failed = waitForWorkspaceSetupProgress(
+        client,
+        (payload) => payload.status === "failed",
+      );
+      const workspace = await createWorkspaceThroughDaemon(client, {
+        cwd: repo.path,
+        worktreeSlug: "workspace-setup-invalid-config",
+      });
+      const failedPayload = await failed;
+      expect(failedPayload.error).toContain("Failed to parse paseo.json");
+      expect(failedPayload.detail.commands).toEqual([]);
+
+      await openHomeWithProject(page, repo.path);
+      await navigateToWorkspaceViaSidebar(page, workspace.id);
+      await expectFailedSetupTabSeededInMainPane(page, workspace.id);
+      await expect(page.getByText(/Failed to parse paseo\.json at/)).toBeVisible();
+      await closeSetupTab(page, workspace.id);
+      await clickNewChat(page);
+      await expectComposerVisible(page);
+      await openFileExplorer(page);
+      await expectExplorerEntryVisible(page, "paseo.json");
     } finally {
       await client.close();
       await repo.cleanup();

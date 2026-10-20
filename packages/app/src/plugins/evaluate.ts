@@ -1,3 +1,9 @@
+import type { createPluginHosts } from "./hosts";
+import { openExternalUrl } from "@/utils/open-external-url";
+import * as pluginUiRuntime from "./react-native/ui";
+import { useSettings } from "./settings/use-settings";
+import * as pluginSharedRuntime from "@getpaseo/plugin";
+import * as pluginClientRuntime from "@getpaseo/plugin/client";
 import * as React from "react";
 import * as ReactJsxRuntime from "react/jsx-runtime";
 // eslint-disable-next-line no-restricted-imports -- plugin client runtime injects host ReactNative.
@@ -6,26 +12,28 @@ import * as ReactNative from "react-native";
 import * as ReactQuery from "@tanstack/react-query";
 import * as Zod from "zod";
 import {
-  defineAttachmentSource,
-  defineRpc,
   type PluginAttachmentSourceContribution,
-  type PluginCommandCenterItemContribution,
-  type PluginClientContribution,
-  type PluginSidebarContribution,
-  type PluginSurfaceProps,
+  type PluginCleanup,
   type PluginThemeContribution,
+} from "@getpaseo/plugin";
+import {
+  type PluginCommandCenterItemContribution,
+  type PluginClientContext,
+  type PluginClientSlashCommandContribution,
+  type PluginSidebarContribution,
+  type PluginScreenContribution,
+  type PluginScreenProps,
+  type PluginScreenTitle,
+  type PluginSidebarItemContribution,
+  type PluginSurfaceProps,
   type PluginTimelineRendererContribution,
   type PluginTimelineTransformerContribution,
   type PluginWorkspacePanelContribution,
-  usePaseo,
-  useAgent,
-  useWorkspace,
-  useRpc,
-} from "@getpaseo/plugin";
-import { createPluginContext, type PluginRegistrationCollector } from "@getpaseo/plugin/host";
-import type { EvaluatedPlugin } from "./types";
+  type PluginButtonRegistration,
+} from "@getpaseo/plugin/client";
+import type { EvaluatedPlugin, PluginSidebarSection } from "./types";
 import type { ComponentType } from "react";
-import { Icon, resolvePluginIcon } from "./icons";
+import { parsePluginIcon, parseSerializablePluginIcon } from "./icons";
 import { pluginReactNativeRuntime } from "./react-native/runtime";
 import { parsePluginThemeContribution } from "./themes";
 
@@ -61,55 +69,190 @@ function normalizePanelLocations(
   return normalized;
 }
 
+function isComponentType(value: unknown): boolean {
+  return (
+    typeof value === "function" ||
+    (typeof value === "object" && value !== null && "$$typeof" in value)
+  );
+}
+
 function requireId(value: string, label: string): string {
   const id = value.trim();
   if (!CONTRIBUTION_ID.test(id)) throw new Error(`Invalid ${label}: ${value}`);
   return id;
 }
 
-export function evaluatePluginClientBundle(id: string, bundle: string): EvaluatedPlugin {
-  const collector: PluginRegistrationCollector = {
+/** A non-empty string, or a function of the screen's params resolved when the header renders. */
+function requireScreenTitle(screenId: string, title: unknown): PluginScreenTitle {
+  if (typeof title === "function") return title as PluginScreenTitle;
+  if (typeof title === "string" && title.trim()) return title.trim();
+  throw new Error(`Screen ${screenId} needs a title: a non-empty string or a function of params`);
+}
+
+export type PluginClientRuntime = Pick<
+  PluginClientContext,
+  | "playAudio"
+  | "paseo"
+  | "rpc"
+  | "openSettings"
+  | "openScreen"
+  | "openSurface"
+  | "openPanel"
+  | "addComposerPill"
+  | "addHeaderButton"
+> & { hosts: ReturnType<typeof createPluginHosts> };
+
+export function runPluginClientBundle(
+  id: string,
+  bundle: string,
+  runtime: PluginClientRuntime,
+  onChange: () => void = () => undefined,
+): EvaluatedPlugin {
+  const collector: Omit<EvaluatedPlugin, "id" | "cleanup"> = {
     surfaces: [],
-    sidebarItems: [],
+    settingsScreens: [],
+    sidebarItems: { header: [], footer: [] },
+    legacySidebarItems: [],
     workspacePanels: [],
     commandCenterItems: [],
-    clientSide: null,
+    clientSlashCommands: [],
     attachmentSources: [],
     themes: [],
     timelineTransformers: [],
     timelineRenderers: [],
   };
   const surfaceIds = new Set<string>();
-  const sidebarItemIds = new Set<string>();
+  const settingsScreenIds = new Set<string>();
+  const sidebarItemIds: Record<PluginSidebarSection, Set<string>> = {
+    header: new Set(),
+    footer: new Set(),
+  };
   const workspacePanelIds = new Set<string>();
   const commandCenterItemIds = new Set<string>();
+  const clientSlashCommandNames = new Set<string>();
   const attachmentSourceIds = new Set<string>();
   const themeIds = new Set<string>();
   const timelineTransformerIds = new Set<string>();
   const timelineRendererIds = new Set<string>();
-  const pluginContext = createPluginContext({
-    addSurface(surfaceId: string, Component: ComponentType<PluginSurfaceProps>) {
-      const normalizedId = requireId(surfaceId, "surface id");
-      if (surfaceIds.has(normalizedId)) throw new Error(`Duplicate surface: ${normalizedId}`);
-      if (typeof Component !== "function")
-        throw new Error(`Surface ${normalizedId} is not a component`);
-      surfaceIds.add(normalizedId);
-      collector.surfaces.push({ id: normalizedId, Component });
+  const removals = new Set<PluginCleanup>();
+  let setupComplete = false;
+  let stopped = false;
+  function trackButton(registration: PluginButtonRegistration): PluginButtonRegistration {
+    let active = true;
+    const remove = () => {
+      if (!active) return;
+      active = false;
+      registration.remove();
+      removals.delete(remove);
+    };
+    removals.add(remove);
+    return {
+      update: (patch) => {
+        if (active && !stopped) registration.update(patch);
+      },
+      remove,
+    };
+  }
+  const notifyChange = () => {
+    if (setupComplete) onChange();
+  };
+  function register<T>(items: T[], item: T, release: () => void): PluginCleanup {
+    items.push(item);
+    notifyChange();
+    let active = true;
+    const remove = () => {
+      if (!active) return;
+      active = false;
+      const index = items.indexOf(item);
+      if (index !== -1) items.splice(index, 1);
+      release();
+      removals.delete(remove);
+      notifyChange();
+    };
+    removals.add(remove);
+    return remove;
+  }
+  function addSidebarItem(
+    section: PluginSidebarSection,
+    contribution: PluginSidebarItemContribution,
+  ): PluginCleanup {
+    const ids = sidebarItemIds[section];
+    const normalizedId = requireId(contribution.id, `sidebar ${section} item id`);
+    if (ids.has(normalizedId))
+      throw new Error(`Duplicate sidebar ${section} item: ${normalizedId}`);
+    const title = contribution.title.trim();
+    if (!title) throw new Error(`Sidebar item ${normalizedId} has no title`);
+    if (!isComponentType(contribution.Component)) {
+      throw new Error(`Sidebar item ${normalizedId} is not a component`);
+    }
+    ids.add(normalizedId);
+    return register(
+      collector.sidebarItems[section],
+      { id: normalizedId, title, Component: contribution.Component },
+      () => ids.delete(normalizedId),
+    );
+  }
+  const pluginContext: PluginClientContext = {
+    ...runtime,
+    addSettingsScreen(contribution) {
+      const screenId = requireId(contribution.id, "settings screen id");
+      if (settingsScreenIds.has(screenId))
+        throw new Error(`Duplicate settings screen: ${screenId}`);
+      if (!contribution.title.trim()) throw new Error(`Invalid settings screen: ${screenId}`);
+      const icon = parsePluginIcon(`Settings screen ${screenId}`, contribution.icon);
+      settingsScreenIds.add(screenId);
+      return register(collector.settingsScreens, { ...contribution, id: screenId, icon }, () =>
+        settingsScreenIds.delete(screenId),
+      );
     },
+    addScreen(contribution: PluginScreenContribution) {
+      if (typeof contribution !== "object" || contribution === null) {
+        throw new Error("addScreen takes { id, title, Component }");
+      }
+      const normalizedId = requireId(contribution.id, "screen id");
+      if (surfaceIds.has(normalizedId)) throw new Error(`Duplicate screen: ${normalizedId}`);
+      const title = requireScreenTitle(normalizedId, contribution.title);
+      if (!isComponentType(contribution.Component)) {
+        throw new Error(`Screen ${normalizedId} is not a component`);
+      }
+      surfaceIds.add(normalizedId);
+      return register(
+        collector.surfaces,
+        { id: normalizedId, title, Component: contribution.Component },
+        () => surfaceIds.delete(normalizedId),
+      );
+    },
+    addSidebarHeaderItem(contribution: PluginSidebarItemContribution) {
+      return addSidebarItem("header", contribution);
+    },
+    addSidebarFooterItem(contribution: PluginSidebarItemContribution) {
+      return addSidebarItem("footer", contribution);
+    },
+    // COMPAT(pluginSidebarAliases): added in v0.11.0, remove after 2027-03-29
+    // Titled by its id; a legacy item pointing at it lends the header its own title instead.
+    addSurface(surfaceId: string, Component: ComponentType<PluginSurfaceProps>) {
+      if (!isComponentType(Component)) throw new Error(`Screen ${surfaceId} is not a component`);
+      return pluginContext.addScreen({
+        id: surfaceId,
+        title: surfaceId,
+        Component: (props: PluginScreenProps) => React.createElement(Component, props),
+      });
+    },
+    // COMPAT(pluginSidebarAliases): added in v0.11.0, remove after 2027-03-29
     addSidebarItem(contribution: PluginSidebarContribution) {
       const normalizedId = requireId(contribution.id, "sidebar item id");
-      if (sidebarItemIds.has(normalizedId))
-        throw new Error(`Duplicate sidebar item: ${normalizedId}`);
-      if (!contribution.title.trim()) throw new Error(`Sidebar item ${normalizedId} has no title`);
-      if (!contribution.icon.trim()) throw new Error(`Sidebar item ${normalizedId} has no icon`);
-      resolvePluginIcon(contribution.icon.trim());
-      sidebarItemIds.add(normalizedId);
-      collector.sidebarItems.push({
+      const legacy = {
         id: normalizedId,
         title: contribution.title.trim(),
-        icon: contribution.icon.trim(),
+        icon: parsePluginIcon(`Sidebar item ${normalizedId}`, contribution.icon),
         surface: requireId(contribution.surface, "sidebar surface id"),
-      });
+      };
+      // Shares the header's ids: the sidebar orders both kinds of item under one key.
+      const ids = sidebarItemIds.header;
+      if (ids.has(normalizedId)) throw new Error(`Duplicate sidebar header item: ${normalizedId}`);
+      if (!legacy.title) throw new Error(`Sidebar item ${normalizedId} has no title`);
+      ids.add(normalizedId);
+      return register(collector.legacySidebarItems, legacy, () => ids.delete(normalizedId));
     },
     addWorkspacePanel(contribution: PluginWorkspacePanelContribution) {
       const normalizedId = requireId(contribution.id, "workspace panel id");
@@ -117,25 +260,27 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
         throw new Error(`Duplicate workspace panel: ${normalizedId}`);
       }
       const title = contribution.title.trim();
-      const icon = contribution.icon.trim();
       if (!title) throw new Error(`Workspace panel ${normalizedId} has no title`);
-      if (!icon) throw new Error(`Workspace panel ${normalizedId} has no icon`);
+      const icon = parsePluginIcon(`Workspace panel ${normalizedId}`, contribution.icon);
       if (contribution.context !== "workspace" && contribution.context !== "agent") {
         throw new Error(`Workspace panel ${normalizedId} has invalid context`);
       }
       if (typeof contribution.Component !== "function") {
         throw new Error(`Workspace panel ${normalizedId} is not a component`);
       }
-      resolvePluginIcon(icon);
       const locations = normalizePanelLocations(normalizedId, contribution.locations);
       workspacePanelIds.add(normalizedId);
-      collector.workspacePanels.push({
-        ...contribution,
-        id: normalizedId,
-        title,
-        icon,
-        locations,
-      });
+      return register(
+        collector.workspacePanels,
+        {
+          ...contribution,
+          id: normalizedId,
+          title,
+          icon,
+          locations,
+        },
+        () => workspacePanelIds.delete(normalizedId),
+      );
     },
     addCommandCenterItem(contribution: PluginCommandCenterItemContribution) {
       const normalizedId = requireId(contribution.id, "Command Center item id");
@@ -143,9 +288,8 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
         throw new Error(`Duplicate Command Center item: ${normalizedId}`);
       }
       const title = contribution.title.trim();
-      const icon = contribution.icon.trim();
       if (!title) throw new Error(`Command Center item ${normalizedId} has no title`);
-      if (!icon) throw new Error(`Command Center item ${normalizedId} has no icon`);
+      const icon = parsePluginIcon(`Command Center item ${normalizedId}`, contribution.icon);
       if (
         contribution.context !== "global" &&
         contribution.context !== "workspace" &&
@@ -156,22 +300,43 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
       if (typeof contribution.onSelect !== "function") {
         throw new Error(`Command Center item ${normalizedId} has no callback`);
       }
-      resolvePluginIcon(icon);
       commandCenterItemIds.add(normalizedId);
-      collector.commandCenterItems.push({
-        ...contribution,
-        id: normalizedId,
-        title,
-        icon,
-        keywords: contribution.keywords?.map((keyword) => keyword.trim()).filter(Boolean),
-      });
+      return register(
+        collector.commandCenterItems,
+        {
+          ...contribution,
+          id: normalizedId,
+          title,
+          icon,
+          keywords: contribution.keywords?.map((keyword) => keyword.trim()).filter(Boolean),
+        },
+        () => commandCenterItemIds.delete(normalizedId),
+      );
     },
-    addClientSide(contribution: PluginClientContribution) {
-      if (collector.clientSide) throw new Error("Plugin has more than one client-side entrypoint");
-      if (typeof contribution !== "function") {
-        throw new Error("Plugin client-side entrypoint is not a function");
+    addSlashCommand(contribution: PluginClientSlashCommandContribution) {
+      const name = requireId(contribution.name, "client slash command name");
+      if (clientSlashCommandNames.has(name)) {
+        throw new Error(`Duplicate client slash command: ${name}`);
       }
-      collector.clientSide = contribution;
+      const description = contribution.description.trim();
+      if (!description) throw new Error(`Client slash command ${name} has no description`);
+      if (contribution.context !== "workspace" && contribution.context !== "agent") {
+        throw new Error(`Client slash command ${name} has invalid context`);
+      }
+      if (typeof contribution.onSubmit !== "function") {
+        throw new Error(`Client slash command ${name} has no callback`);
+      }
+      clientSlashCommandNames.add(name);
+      return register(
+        collector.clientSlashCommands,
+        {
+          ...contribution,
+          name,
+          description,
+          argumentHint: contribution.argumentHint.trim(),
+        },
+        () => clientSlashCommandNames.delete(name),
+      );
     },
     addAttachmentSource(contribution: PluginAttachmentSourceContribution) {
       const normalizedId = requireId(contribution.id, "attachment source id");
@@ -179,34 +344,39 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
         throw new Error(`Duplicate attachment source: ${normalizedId}`);
       }
       const title = contribution.title.trim();
-      const icon = contribution.icon.trim();
       const pickerTitle = contribution.pickerTitle.trim();
       const searchPlaceholder = contribution.searchPlaceholder.trim();
       const method = contribution.search.name.trim();
       if (!title) throw new Error(`Attachment source ${normalizedId} has no title`);
-      if (!icon) throw new Error(`Attachment source ${normalizedId} has no icon`);
+      const icon = parseSerializablePluginIcon(
+        `Attachment source ${normalizedId}`,
+        contribution.icon,
+      );
       if (!pickerTitle) throw new Error(`Attachment source ${normalizedId} has no picker title`);
       if (!searchPlaceholder) {
         throw new Error(`Attachment source ${normalizedId} has no search placeholder`);
       }
       if (!method) throw new Error(`Attachment source ${normalizedId} has no search RPC`);
-      resolvePluginIcon(icon);
       attachmentSourceIds.add(normalizedId);
-      collector.attachmentSources.push({
-        id: normalizedId,
-        title,
-        icon,
-        pickerTitle,
-        searchPlaceholder,
-        search: { ...contribution.search, name: method },
-      });
+      return register(
+        collector.attachmentSources,
+        {
+          id: normalizedId,
+          title,
+          icon,
+          pickerTitle,
+          searchPlaceholder,
+          search: { ...contribution.search, name: method },
+        },
+        () => attachmentSourceIds.delete(normalizedId),
+      );
     },
     addTheme(contribution: PluginThemeContribution) {
       const normalizedId = requireId(contribution.id, "theme id");
       if (themeIds.has(normalizedId)) throw new Error(`Duplicate theme: ${normalizedId}`);
       const theme = parsePluginThemeContribution({ ...contribution, id: normalizedId });
       themeIds.add(normalizedId);
-      collector.themes.push(theme);
+      return register(collector.themes, theme, () => themeIds.delete(normalizedId));
     },
     addTimelineTransformer(contribution: PluginTimelineTransformerContribution) {
       const normalizedId = requireId(contribution.id, "timeline transformer id");
@@ -228,7 +398,9 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
         throw new Error(`Invalid timeline transformer id: ${contribution.id}`);
       }
       timelineTransformerIds.add(normalizedId);
-      collector.timelineTransformers.push(contribution);
+      return register(collector.timelineTransformers, contribution, () =>
+        timelineTransformerIds.delete(normalizedId),
+      );
     },
     addTimelineRenderer(contribution: PluginTimelineRendererContribution) {
       const kind = requireId(contribution.kind, "timeline renderer kind");
@@ -246,29 +418,40 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
         throw new Error(`Timeline renderer ${rendererId} is not a component`);
       }
       timelineRendererIds.add(rendererId);
-      collector.timelineRenderers.push({ ...contribution, kind });
+      return register(collector.timelineRenderers, { ...contribution, kind }, () =>
+        timelineRendererIds.delete(rendererId),
+      );
     },
-  });
+    addComposerPill(contribution) {
+      if (stopped) throw new Error("Plugin has stopped");
+      return trackButton(runtime.addComposerPill(contribution));
+    },
+    addHeaderButton(contribution) {
+      if (stopped) throw new Error("Plugin has stopped");
+      return trackButton(runtime.addHeaderButton(contribution));
+    },
+  };
   const runtimeRequire = (name: string): unknown => {
+    if (name === "@getpaseo/plugin/client/ui") return pluginUiRuntime;
     if (name === "react") return React;
     if (name === "react/jsx-runtime") return ReactJsxRuntime;
     if (name === "react-native") return ReactNative;
-    if (name === "@getpaseo/plugin") {
+    if (name === "@getpaseo/plugin") return pluginSharedRuntime;
+    if (name === "@getpaseo/plugin/client")
       return {
-        defineAttachmentSource,
-        defineRpc,
-        Icon,
-        usePaseo,
-        useAgent,
-        useWorkspace,
-        useRpc,
+        ...pluginClientRuntime,
+        useSettings,
+        openExternalUrl,
+        getPaseoClient: (serverId: string) => runtime.hosts.getPaseoClient(serverId),
+        useHosts: () =>
+          React.useSyncExternalStore(
+            runtime.hosts.subscribe,
+            runtime.hosts.getSnapshot,
+            runtime.hosts.getSnapshot,
+          ),
       };
-    }
-    if (name === "@getpaseo/plugin/react-native" || name === "@paseo/plugin/react-native") {
+    if (name === "@getpaseo/plugin/client/react-native") {
       return pluginReactNativeRuntime;
-    }
-    if (name === "@getpaseo/plugin/server") {
-      return { defineAttachmentSource, defineRpc };
     }
     if (name === "@tanstack/react-query") return ReactQuery;
     if (name === "zod") return Zod;
@@ -284,35 +467,52 @@ export function evaluatePluginClientBundle(id: string, bundle: string): Evaluate
   if (typeof setup !== "function") {
     throw new Error(`Plugin ${id} must default export a function`);
   }
-  const cleanup = setup(pluginContext);
-  if (typeof cleanup !== "function") {
-    throw new Error(`Plugin ${id} contribution must return a cleanup function`);
-  }
-
+  let entryCleanup: PluginCleanup | undefined;
   try {
-    for (const item of collector.sidebarItems) {
+    entryCleanup = setup(pluginContext);
+    if (typeof entryCleanup !== "function")
+      throw new Error(`Plugin ${id} contribution must return a cleanup function`);
+    for (const item of collector.legacySidebarItems) {
       if (!surfaceIds.has(item.surface)) {
         throw new Error(`Sidebar item ${item.id} references missing surface ${item.surface}`);
       }
     }
   } catch (error) {
+    stopped = true;
     try {
-      void Promise.resolve(cleanup()).catch((cleanupError) => {
+      void Promise.resolve(
+        typeof entryCleanup === "function" ? entryCleanup() : entryCleanup,
+      ).catch((cleanupError) => {
         console.warn(`[Plugins] Cleanup failed after setup error for ${id}`, cleanupError);
       });
     } catch (cleanupError) {
       console.warn(`[Plugins] Cleanup failed after setup error for ${id}`, cleanupError);
+    } finally {
+      for (const remove of removals) remove();
     }
     throw error;
   }
+  setupComplete = true;
+  const cleanupEntry = entryCleanup;
+  const cleanup = async () => {
+    if (stopped) return;
+    stopped = true;
+    try {
+      await cleanupEntry();
+    } finally {
+      for (const remove of removals) remove();
+    }
+  };
   return {
     id,
     cleanup,
     surfaces: collector.surfaces,
+    settingsScreens: collector.settingsScreens,
     sidebarItems: collector.sidebarItems,
+    legacySidebarItems: collector.legacySidebarItems,
     workspacePanels: collector.workspacePanels as EvaluatedPlugin["workspacePanels"],
     commandCenterItems: collector.commandCenterItems,
-    clientSide: collector.clientSide,
+    clientSlashCommands: collector.clientSlashCommands,
     attachmentSources: collector.attachmentSources,
     themes: collector.themes,
     timelineTransformers: collector.timelineTransformers,

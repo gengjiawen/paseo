@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import type { StateStorage } from "zustand/middleware";
 import {
   createSidebarViewStorage,
@@ -7,14 +7,6 @@ import {
   SIDEBAR_UNLABELLED_LABEL_KEY,
   useSidebarViewStore,
 } from "./sidebar-view-store";
-
-vi.mock("@react-native-async-storage/async-storage", () => ({
-  default: {
-    getItem: vi.fn().mockResolvedValue(null),
-    setItem: vi.fn().mockResolvedValue(undefined),
-    removeItem: vi.fn().mockResolvedValue(undefined),
-  },
-}));
 
 interface MemoryStorage extends StateStorage<Promise<void>> {
   reads: string[];
@@ -40,6 +32,7 @@ function createMemoryStorage(entries: Record<string, string | null>): MemoryStor
 describe("sidebar view store", () => {
   beforeEach(() => {
     useSidebarViewStore.setState({
+      showBackground: false,
       groupMode: "project",
       hostFilters: [],
       projectFilters: [],
@@ -92,6 +85,7 @@ describe("sidebar view store", () => {
         },
       }),
     ).toEqual({
+      showBackground: false,
       groupMode: "status",
       projectSort: "manual",
       hostFilters: [],
@@ -107,6 +101,7 @@ describe("sidebar view store", () => {
         hostFilter: "host-a",
       }),
     ).toEqual({
+      showBackground: false,
       groupMode: "status",
       projectSort: "manual",
       hostFilters: ["host-a"],
@@ -122,6 +117,7 @@ describe("sidebar view store", () => {
         hostFilters: ["host-a", "host-b"],
       }),
     ).toEqual({
+      showBackground: false,
       groupMode: "status",
       projectSort: "manual",
       hostFilters: ["host-a", "host-b"],
@@ -233,6 +229,7 @@ describe("sidebar view store", () => {
         projectFilters: ["project-a", "project-b"],
       }),
     ).toEqual({
+      showBackground: false,
       groupMode: "project",
       projectSort: "manual",
       hostFilters: ["host-a"],
@@ -243,6 +240,7 @@ describe("sidebar view store", () => {
 
   it("never keeps project filters from state the schema rejects", () => {
     expect(migrateSidebarViewState({ projectFilters: "project-a" })).toEqual({
+      showBackground: false,
       groupMode: "project",
       projectSort: "manual",
       hostFilters: [],
