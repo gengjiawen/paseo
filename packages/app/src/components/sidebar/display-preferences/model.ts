@@ -1,3 +1,4 @@
+import type { WorkspaceSort } from "@/projects/workspace-structure";
 import { useCallback, useMemo } from "react";
 import {
   useAppSettings,
@@ -20,6 +21,8 @@ export interface SidebarDisplayPreferences {
   showBackground: boolean;
   toggleBackground: () => void;
   grouping: SidebarGroupMode;
+  workspaceSort: WorkspaceSort;
+  setWorkspaceSort: (sort: WorkspaceSort) => void;
   setGrouping: (mode: SidebarGroupMode) => void;
   projectSort: SidebarProjectSortMode;
   setProjectSort: (mode: SidebarProjectSortMode) => void;
@@ -55,6 +58,8 @@ export interface SidebarDisplayPreferences {
 export function useSidebarDisplayPreferences(): SidebarDisplayPreferences {
   const showBackground = useSidebarViewStore((state) => state.showBackground);
   const toggleBackground = useSidebarViewStore((state) => state.toggleBackground);
+  const workspaceSort = useSidebarViewStore((state) => state.workspaceSort);
+  const setWorkspaceSort = useSidebarViewStore((state) => state.setWorkspaceSort);
   const grouping = useSidebarViewStore((state) => state.groupMode);
   const setGrouping = useSidebarViewStore((state) => state.setGroupMode);
   const projectSort = useSidebarViewStore((state) => state.projectSort);
@@ -116,6 +121,8 @@ export function useSidebarDisplayPreferences(): SidebarDisplayPreferences {
       showBackground,
       toggleBackground,
       grouping,
+      workspaceSort,
+      setWorkspaceSort,
       setGrouping,
       projectSort,
       setProjectSort,
@@ -141,6 +148,8 @@ export function useSidebarDisplayPreferences(): SidebarDisplayPreferences {
       showBackground,
       toggleBackground,
       grouping,
+      workspaceSort,
+      setWorkspaceSort,
       setGrouping,
       projectSort,
       setProjectSort,

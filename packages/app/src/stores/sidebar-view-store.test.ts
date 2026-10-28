@@ -32,6 +32,7 @@ function createMemoryStorage(entries: Record<string, string | null>): MemoryStor
 describe("sidebar view store", () => {
   beforeEach(() => {
     useSidebarViewStore.setState({
+      workspaceSort: "created",
       showBackground: false,
       groupMode: "project",
       hostFilters: [],
@@ -85,6 +86,7 @@ describe("sidebar view store", () => {
         },
       }),
     ).toEqual({
+      workspaceSort: "created",
       showBackground: false,
       groupMode: "status",
       projectSort: "manual",
@@ -101,6 +103,7 @@ describe("sidebar view store", () => {
         hostFilter: "host-a",
       }),
     ).toEqual({
+      workspaceSort: "created",
       showBackground: false,
       groupMode: "status",
       projectSort: "manual",
@@ -117,6 +120,7 @@ describe("sidebar view store", () => {
         hostFilters: ["host-a", "host-b"],
       }),
     ).toEqual({
+      workspaceSort: "created",
       showBackground: false,
       groupMode: "status",
       projectSort: "manual",
@@ -229,6 +233,7 @@ describe("sidebar view store", () => {
         projectFilters: ["project-a", "project-b"],
       }),
     ).toEqual({
+      workspaceSort: "created",
       showBackground: false,
       groupMode: "project",
       projectSort: "manual",
@@ -240,6 +245,7 @@ describe("sidebar view store", () => {
 
   it("never keeps project filters from state the schema rejects", () => {
     expect(migrateSidebarViewState({ projectFilters: "project-a" })).toEqual({
+      workspaceSort: "created",
       showBackground: false,
       groupMode: "project",
       projectSort: "manual",
@@ -291,4 +297,15 @@ describe("sidebar view store", () => {
     );
     expect(storage.reads).toEqual(["sidebar-view"]);
   });
+});
+
+it("defaults to Created and persists the Last prompt choice across migration", () => {
+  expect(migrateSidebarViewState({}).workspaceSort).toBe("created");
+  expect(
+    migrateSidebarViewState({ workspaceSort: "lastPrompt", groupMode: "status" }),
+  ).toMatchObject({ workspaceSort: "lastPrompt", groupMode: "status" });
+});
+
+it("retains the manual sorting preference on reload", () => {
+  expect(migrateSidebarViewState({ workspaceSort: "manual" }).workspaceSort).toBe("manual");
 });
